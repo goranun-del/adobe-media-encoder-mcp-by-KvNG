@@ -1,0 +1,11 @@
+# 실행 중 생성
+_work/
+presets/
+__pycache__/
+*.pyc
+
+# 개발용(테스트·실측·백업)
+_test/
+probes/
+_x/
+my_pids.txt
