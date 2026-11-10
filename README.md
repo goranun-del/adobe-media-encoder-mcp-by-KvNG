@@ -27,7 +27,7 @@ Claude → `server.py`(MCP, stdio) → `AfterFX.com -r`(AE 메인 엔진에서 j
 - After Effects, Media Encoder 같은 세대(실측: AE 2026 26.5, AME 2026 26.5.2)
 - Python 3 + `mcp`, `psutil` (실측: Python 3.14, mcp 1.12.4). 설치: `pip install -r requirements.txt`
 - 출력 실측(선택): `ffprobe` PATH
-- AE가 꺼져 있으면 `AfterFX.com -r`이 AE를 띄운다(기동 시간 걸림). AME가 꺼져 있으면 BridgeTalk가 AME를 띄운다(약 6초).
+- AE 가 꺼져 있으면 바로 오류를 낸다(v1.002, AE 를 먼저 실행). AME 가 꺼져 있으면 BridgeTalk 가 AME 를 띄운다(첫 대기열 추가 약 27초).
 
 ## 등록
 
@@ -67,7 +67,9 @@ AE 경로를 직접 지정하려면 환경변수 `AMEMCP_AFTERFX_COM`에 `AfterF
 - **포맷 이름**은 AME 언어를 따른다(예: `HEVC(H.265)`, `H.264 블루레이`). H.264·QuickTime·HEVC·MPEG4는 프리셋 폴더로 자동 판별, 나머지는 `queue_comp`의 `format`에 `ame_status`의 포맷 이름을 그대로 넣는다.
 - **진행률:** AME 진행률 이벤트는 출력 경로가 비어 오거나 시작 이벤트보다 먼저 올 때가 있어, `wait` 시간 초과 시의 `queue_progress`는 대기열 기준 값이다. 완료 판정은 출력 경로로 정확히 매칭한다.
 - **AE MCP 브릿지와 별개:** AE MCP가 CEP 경로로 붙은 상태에서는 BridgeTalk를 쓸 수 없어서, 이 서버는 `AfterFX.com -r`로 AE를 직접 호출한다(`AfterFX.exe -r`은 동작 안 함).
-- **실행 중인 AE를 그대로 쓴다.** `-r` 스크립트는 AE 프로젝트를 건드리지 않지만, 실작업 프로젝트가 열린 AE에서도 실행된다. 신경 쓰이면 작업 중이 아닐 때 쓸 것.
+- **AE 창 포커스(v1.001):** `AfterFX -r` 은 AE 창을 맨 앞으로 끌어온다. 호출 전 맨 앞 창을 기억했다가 AE·AME 가 가져가면 되돌린다(실측: AE 가 0.05~0.1초 보였다가 복귀). 그래서 호출마다 약 2초 더 걸린다.
+- **AE 를 붙잡지 않음(v1.001):** 예전에는 AE 쪽 스크립트가 AME 회신까지 기다려(AME 가 꺼진 상태의 queue_comp 35초 실측) 그동안 AE MCP 가 먹통이었다. 지금은 BridgeTalk 를 보내고 바로 끝나며 회신은 결과 파일로 받는다(AME 켜진 상태 AE 응답 지연 0건/50초 측정). AME 가 꺼진 상태에서 시작해도 AME 기동·다이나믹 링크 26.7초 동안 AE 응답 지연 0건(v1.000 은 같은 구간 35초 무응답). 렌더 중에는 AE 응답이 0.3~1초로 느려진다(시간초과 없음).
+- **작업 중 표시(v1.001):** AE 에 요청을 넣는 동안 `Documents\ae-mcp-bridge\ame_mcp_busy.json` 에 busy=true 를 쓴다. AE MCP(v1.002 이상)가 무응답 진단에 "AME MCP 요청 처리 중"으로 표시한다.- **실행 중인 AE를 그대로 쓴다.** `-r` 스크립트는 AE 프로젝트를 건드리지 않지만, 실작업 프로젝트가 열린 AE에서도 실행된다. 신경 쓰이면 작업 중이 아닐 때 쓸 것.
 - **AE에 대화상자가 떠 있으면** `-r` 스크립트가 막혀 응답 없음 오류가 난다.
 - 실패 렌더(result=False) 경로는 실측하지 않았다.
 

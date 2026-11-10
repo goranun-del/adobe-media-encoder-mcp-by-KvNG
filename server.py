@@ -5,7 +5,7 @@
 - 출력 파일은 덮어쓰지 않는다(있으면 _02, _03 ...).
 - 경로는 하드코딩하지 않는다. 설치 위치는 실행 중인 프로세스·Program Files 에서 찾고, 환경변수로 덮어쓸 수 있다.
 """
-import json, os, re, struct, subprocess, threading, time, uuid
+import ctypes, json, os, re, struct, subprocess, threading, time, uuid
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -84,8 +84,74 @@ def _arg(v):
     return 'decodeURIComponent("%s")' % quote(str(v), safe="")
 
 
+class _Foreground:
+    """AfterFX -r 은 AE 창을 맨 앞으로 끌어온다(2026-11-04 실측, BridgeTalk 로 AME 를 띄우면 AME 도).
+    호출 전 포그라운드 창을 기억해 두고, AE·AME 가 가져가면 되돌린다(v1.001, 최대 5회)."""
+    NAMES = {"afterfx.exe", "adobe media encoder.exe"}
+
+    def __init__(self):
+        self.u = ctypes.windll.user32 if os.name == "nt" else None
+        if self.u:   # 64비트 창 핸들이 int 로 잘리지 않게
+            self.u.GetForegroundWindow.restype = ctypes.c_void_p
+            self.u.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            self.u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.prev = self.u.GetForegroundWindow() if self.u else 0
+        self.off = not self.prev or self._is_adobe(self.prev)   # 원래 AE·AME 가 앞이었으면 건드리지 않음
+        self.restores = 0
+
+    def _is_adobe(self, h):
+        pid = ctypes.c_ulong()
+        self.u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        try:
+            return psutil.Process(pid.value).name().lower() in self.NAMES
+        except psutil.Error:
+            return False
+
+    def keep(self, settle=0.0):
+        """settle 초 동안 지켜보다 AE·AME 가 앞이면 원래 창으로."""
+        end = time.time() + settle
+        while not self.off and self.restores < 5:
+            h = self.u.GetForegroundWindow()
+            if h != self.prev and self._is_adobe(h):
+                # 백그라운드 프로세스의 SetForegroundWindow 는 막혀 있다 → 현재 포그라운드 스레드 입력에 잠깐 붙어서 호출
+                # (AE 에 키 입력을 보내지 않음. 2026-11-04 실측 attach=True set=True)
+                tid = self.u.GetWindowThreadProcessId(h, None)
+                me = ctypes.windll.kernel32.GetCurrentThreadId()
+                self.u.AttachThreadInput(me, tid, True)
+                self.u.SetForegroundWindow(self.prev)
+                self.u.AttachThreadInput(me, tid, False)
+                if self.u.GetForegroundWindow() != self.prev:
+                    # Attach 만으로는 3/4(실측). 기능이 할당되지 않은 가상키 0x07 입력 1회로 잠금을 풀고 재시도(4/4)
+                    self.u.keybd_event(0x07, 0, 0, 0)
+                    self.u.keybd_event(0x07, 0, 2, 0)
+                    self.u.SetForegroundWindow(self.prev)
+                # AE 가 스크립트 실행 중이면 실패할 수 있다(실측) → 성공만 센다. 실패하면 다음 확인 때 다시 시도
+                if self.u.GetForegroundWindow() == self.prev:
+                    self.restores += 1
+            if time.time() >= end:
+                return
+            time.sleep(0.05)
+
+
+def _busy(func):
+    """AE MCP 무응답 진단용 표시: AME MCP 가 AE 에 -r·BridgeTalk 를 보내는 동안 Documents\\ae-mcp-bridge\\ame_mcp_busy.json 에
+    {busy, func, since, pid} 를 쓴다(AE MCP 의 diagnostics 가 읽어 원인으로 표시). 끝나면 busy=false 로 덮어씀(파일은 남김)."""
+    try:
+        d = Path(os.environ.get("USERPROFILE", "~")).expanduser() / "Documents" / "ae-mcp-bridge"
+        if d.is_dir():
+            (d / "ame_mcp_busy.json").write_text(json.dumps(
+                {"busy": bool(func), "func": func, "since": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "epoch": time.time(), "pid": os.getpid()}),
+                encoding="utf-8")
+    except OSError:
+        pass   # 진단 표시 실패로 본 작업을 막지 않음
+
+
 def call_ame(func, *args, launch=True, timeout=90):
     """ame_lib.es 의 AMEMCP.<func>(args) 를 AME 에서 실행하고 dict 를 돌려준다."""
+    # v1.002: AE 가 꺼져 있으면 AfterFX.com -r 이 AE 를 새로 띄우는데, 그 AE 가 회신 전에 종료돼 결과가 안 오는 것을
+    # 실측(2026-11-04, 150초 timeout). 몰래 AE 를 띄우지 않고 바로 알린다.
+    if not [p for p in _procs("AfterFX.exe") if "-m" not in (p["cmdline"] or [])]:
+        raise RuntimeError("After Effects 가 실행 중이 아님. AE 를 먼저 실행한 뒤 다시 호출(AME MCP 는 AE 를 통해 AME 에 명령을 보냄)")
     with _lock:
         WORK.mkdir(exist_ok=True)
         rid = uuid.uuid4().hex[:8]
@@ -101,18 +167,26 @@ def call_ame(func, *args, launch=True, timeout=90):
             "$.evalFile(new File(%s));\n" % (json.dumps(rid), json.dumps(fs(body_f)), json.dumps(fs(out_f)),
                                              "false" if launch else "true", timeout, json.dumps(fs(HERE / "ae_runner.jsx"))),
             encoding="utf-8-sig")
+        _busy(func)
+        fg = _Foreground()
         proc = subprocess.Popen([str(afterfx_com()), "-r", str(stub_f)], creationflags=subprocess.CREATE_NO_WINDOW,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         end = time.time() + timeout + 30
         while time.time() < end:
+            fg.keep()
             txt = out_f.read_text(encoding="utf-8", errors="replace")
             if txt.startswith(rid + "\n"):
                 break
-            time.sleep(0.5)
+            time.sleep(0.1)
         else:
             if proc.poll() is None:
                 proc.kill()  # 내가 띄운 AfterFX.com 만
-            raise RuntimeError("AE 응답 없음(%ds). AE 가 대화상자에 막혔거나 기동 중인지 확인" % (timeout + 30))
+            _busy(None)
+            ame_up = bool(_procs("Adobe Media Encoder.exe"))
+            raise RuntimeError("AE·AME 응답 없음(%ds). %s AE·AME 화면에 대화상자(누락 이펙트·폰트 경고 등)가 떠 있는지 확인"
+                               % (timeout + 30, "AME 실행 중." if ame_up else "AME 가 아직 안 떠 있음(기동 중이거나 기동 실패)."))
+        _busy(None)
+        fg.keep(settle=2.0)   # AE·AME 가 늦게 앞으로 오는 경우 대비(-r 실측은 실행기 종료 직후 1회)
         r = txt[len(rid) + 1:]
         if r == "NOT_RUNNING":
             return {"ok": True, "ame_running": False}
